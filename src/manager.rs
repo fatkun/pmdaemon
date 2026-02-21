@@ -468,35 +468,60 @@ impl ProcessManager {
     ) -> Result<()> {
         let process_id = self.resolve_identifier(identifier).await?;
 
-        let mut processes = self.processes.write().await;
-        if let Some(process) = processes.get_mut(&process_id) {
-            // Handle port deallocation and reallocation if there's an override
-            if let Some(new_port_config) = port_override {
-                // Deallocate current port if any
-                if let Some(current_port_config) = &process.config.port {
-                    self.deallocate_ports(current_port_config, process.assigned_port)
-                        .await;
+        let (process_name, new_pid) = {
+            let mut processes = self.processes.write().await;
+            if let Some(process) = processes.get_mut(&process_id) {
+                // Handle port deallocation and reallocation if there's an override
+                if let Some(new_port_config) = port_override {
+                    // Deallocate current port if any
+                    if let Some(current_port_config) = &process.config.port {
+                        self.deallocate_ports(current_port_config, process.assigned_port)
+                            .await;
+                    }
+
+                    // Allocate new port
+                    let assigned_port = self
+                        .allocate_port(&new_port_config, &process.config.name)
+                        .await?;
+                    process.assigned_port = Some(assigned_port);
+
+                    // Persist the port override in process config
+                    process.config.port = Some(new_port_config);
+
+                    // Update environment variable
+                    process
+                        .config
+                        .env
+                        .insert("PORT".to_string(), assigned_port.to_string());
+
+                    info!(
+                        "Restarting {} with new port: {}",
+                        process.config.name, assigned_port
+                    );
                 }
 
-                // Allocate new port
-                let assigned_port = self
-                    .allocate_port(&new_port_config, &process.config.name)
-                    .await?;
-                process.assigned_port = Some(assigned_port);
+                process.restart().await?;
+                let new_pid = process.pid();
+                process.set_stored_pid(new_pid);
 
-                // Update environment variable
-                process
-                    .config
-                    .env
-                    .insert("PORT".to_string(), assigned_port.to_string());
-
-                info!(
-                    "Restarting {} with new port: {}",
-                    process.config.name, assigned_port
-                );
+                // Keep values for persistence after releasing the lock
+                (process.config.name.clone(), new_pid)
+            } else {
+                return Ok(());
             }
+        };
 
-            process.restart().await?;
+        // Persist latest runtime state for future CLI invocations.
+        if let Some(pid) = new_pid {
+            self.save_pid_file(&process_name, pid).await?;
+        } else {
+            self.remove_pid_file(&process_name).await?;
+        }
+
+        let processes = self.processes.read().await;
+        if let Some(process) = processes.get(&process_id) {
+            self.save_process_config(process).await?;
+            self.save_process_metadata(process).await?;
         }
 
         Ok(())
@@ -1847,6 +1872,7 @@ impl ProcessManager {
             } else {
                 // PID file exists but process is not running, clean up
                 process.set_state(crate::process::ProcessState::Stopped);
+                process.set_stored_pid(None);
                 if let Err(e) = self.remove_pid_file(&config.name).await {
                     warn!("Failed to remove stale PID file for {}: {}", config.name, e);
                 }
@@ -1854,6 +1880,7 @@ impl ProcessManager {
         } else {
             // No PID file, process is stopped
             process.set_state(crate::process::ProcessState::Stopped);
+            process.set_stored_pid(None);
         }
 
         let process_name = config.name.clone();
@@ -2139,6 +2166,20 @@ mod tests {
             .unwrap()
     }
 
+    fn create_long_running_test_config(name: &str) -> ProcessConfig {
+        let builder = ProcessConfig::builder().name(name);
+
+        #[cfg(windows)]
+        let builder = builder
+            .script("cmd")
+            .args(vec!["/C", "ping 127.0.0.1 -n 6 > NUL"]);
+
+        #[cfg(unix)]
+        let builder = builder.script("sh").args(vec!["-c", "sleep 5"]);
+
+        builder.build().unwrap()
+    }
+
     #[test]
     fn test_get_config_dir() {
         let result = ProcessManager::get_config_dir();
@@ -2211,6 +2252,42 @@ mod tests {
         let read_result = manager.read_pid_file(process_name).await;
         assert!(read_result.is_ok());
         assert_eq!(read_result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_restart_persists_latest_pid_to_disk() {
+        let (mut manager, _temp_dir) = create_test_manager().await;
+        let process_name = "restart-persist-pid";
+        let config = create_long_running_test_config(process_name);
+
+        manager.start(config).await.unwrap();
+        let initial_pid = manager.read_pid_file(process_name).await.unwrap().unwrap();
+        assert!(initial_pid > 0);
+
+        manager.restart(process_name).await.unwrap();
+
+        let latest_pid = manager.read_pid_file(process_name).await.unwrap().unwrap();
+        assert!(latest_pid > 0);
+
+        let metadata_file = manager.config_dir.join(format!("{}.meta.json", process_name));
+        let metadata_content = fs::read_to_string(&metadata_file).await.unwrap();
+        let metadata_json: serde_json::Value = serde_json::from_str(&metadata_content).unwrap();
+
+        assert_eq!(
+            metadata_json
+                .get("stored_pid")
+                .and_then(|value| value.as_u64()),
+            Some(latest_pid as u64)
+        );
+
+        let statuses = manager.list().await.unwrap();
+        let status = statuses
+            .iter()
+            .find(|process| process.name == process_name)
+            .unwrap();
+        assert_eq!(status.pid, Some(latest_pid));
+
+        manager.stop(process_name).await.unwrap();
     }
 
     #[tokio::test]
