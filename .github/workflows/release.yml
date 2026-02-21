@@ -27,6 +27,10 @@ jobs:
             target: aarch64-unknown-linux-gnu
             binary_name: pmdaemon
             asset_name: pmdaemon-linux-aarch64
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            binary_name: pmdaemon
+            asset_name: pmdaemon-linux-aarch64-musl
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary_name: pmdaemon.exe
@@ -61,38 +65,27 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           set -eux
-          UBUNTU_CODENAME="$(. /etc/os-release && echo "${UBUNTU_CODENAME}")"
-          sudo dpkg --add-architecture arm64
-
-          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            sudo sed -i '/^Suites:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
-          else
-            sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
-          fi
-
-          cat <<EOF | sudo tee /etc/apt/sources.list.d/arm64-ports.sources >/dev/null
-          Types: deb
-          URIs: http://ports.ubuntu.com/ubuntu-ports
-          Suites: ${UBUNTU_CODENAME} ${UBUNTU_CODENAME}-updates ${UBUNTU_CODENAME}-backports ${UBUNTU_CODENAME}-security
-          Components: main restricted universe multiverse
-          Architectures: arm64
-          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-          EOF
-
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config libssl-dev:arm64
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install cross for musl builds
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       - name: Build release binary
+        if: matrix.target != 'aarch64-unknown-linux-musl'
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
-          PKG_CONFIG_ALLOW_CROSS: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '1' || '' }}
-          PKG_CONFIG_PATH: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '/usr/lib/aarch64-linux-gnu/pkgconfig' || '' }}
-          AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '/usr/lib/aarch64-linux-gnu' || '' }}
-          AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '/usr/include' || '' }}
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Build release binary (musl static)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }}
+
       - name: Strip binary (Unix)
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-latest' && matrix.target != 'aarch64-unknown-linux-musl'
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             aarch64-linux-gnu-strip target/${{ matrix.target }}/release/${{ matrix.binary_name }}
